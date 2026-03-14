@@ -37,6 +37,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from jinja2 import Environment, DictLoader, select_autoescape
 
 import openpyxl
+import httpx
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("titleforge")
@@ -286,7 +287,6 @@ async def ai_expand_abbreviations_batch(titles: list[str], api_key: str = None) 
     Falls back to built-in patterns if API unavailable.
     Returns dict mapping original → expanded title.
     """
-    import httpx
 
     # First apply built-in patterns
     result = {}
@@ -330,7 +330,7 @@ async def ai_expand_abbreviations_batch(titles: list[str], api_key: str = None) 
                         "content-type": "application/json",
                     },
                     json={
-                        "model": "claude-sonnet-4-20250514",
+                        "model": "claude-3-5-sonnet-20241022",
                         "max_tokens": 2000,
                         "messages": [{"role": "user", "content": f"""Expand these abbreviated job titles into their full standardized form.
 Return ONLY a JSON object mapping each original title to its expanded form.
@@ -814,6 +814,37 @@ def run_cleaning_pipeline(df: pd.DataFrame, config: dict) -> tuple[pd.DataFrame,
                              "count": 0, "severity": "info", "p_value": round(sw_p, 6)})
             except Exception:
                 pass
+
+    # ── Step 2b: Missing Value Handling ──
+    for col in pay_cols:
+        if col not in cleaned.columns:
+            continue
+        missing_mask = cleaned[col].isna()
+        cnt = int(missing_mask.sum())
+        if cnt and missing_strategy != 'keep':
+            if missing_strategy == 'drop':
+                cleaned = cleaned[~missing_mask].reset_index(drop=True)
+                desc = f"Dropped {cnt} rows with missing values."
+                sev = "warning"
+            elif missing_strategy == 'fill_mean':
+                fill_val = round(cleaned[col].mean(), 4)
+                cleaned.loc[missing_mask, col] = fill_val
+                desc = f"Filled {cnt} missing values with mean ({fill_val})."
+                sev = "info"
+            elif missing_strategy == 'fill_median':
+                fill_val = round(cleaned[col].median(), 4)
+                cleaned.loc[missing_mask, col] = fill_val
+                desc = f"Filled {cnt} missing values with median ({fill_val})."
+                sev = "info"
+            elif missing_strategy == 'fill_zero':
+                cleaned.loc[missing_mask, col] = 0.0
+                desc = f"Filled {cnt} missing values with 0."
+                sev = "info"
+            else:
+                desc = f"Kept {cnt} missing values as-is."
+                sev = "info"
+            audit.append({"step": 2, "name": "Missing Value Handling", "column": col,
+                         "description": desc, "count": cnt, "severity": sev, "p_value": None})
 
     # ── Step 3: Zero/Negative Handling ──
     for col in pay_cols:
@@ -1493,6 +1524,17 @@ TEMPLATES["cleaning.html"] = """{% extends "base.html" %}
       <div><label class="block text-xs text-slate-500 font-medium mb-1">Z-Score Threshold</label>
         <input name="z_thresh" type="number" value="3.0" step="0.1" min="1.5" max="5" class="w-full border rounded-lg px-3 py-2 text-sm"></div>
     </div>
+    <div class="grid grid-cols-4 gap-4 mb-4">
+      <div><label class="block text-xs text-slate-500 font-medium mb-1">Missing Values</label>
+        <select name="missing_strategy" class="w-full border rounded-lg px-3 py-2 text-sm">
+          <option value="keep">Keep as-is</option>
+          <option value="drop">Drop rows</option>
+          <option value="fill_mean">Fill with mean</option>
+          <option value="fill_median">Fill with median</option>
+          <option value="fill_zero">Fill with zero</option>
+        </select>
+      </div>
+    </div>
     <button type="submit" class="btn-primary text-sm flex items-center gap-2">
       <i data-lucide="sparkles" class="w-4 h-4"></i> Run 8-Step Pipeline
     </button>
@@ -1774,18 +1816,52 @@ jinja_env = Environment(
 )
 
 # In-memory session data (per-user project data)
-_session_data: dict[str, dict] = {}
+
+
+# ── Disk-backed session storage (survives restarts) ──
+SESSIONS_DIR = DATA_DIR / "sessions"
+SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+_session_cache: dict[str, dict] = {}  # in-process cache to avoid repeated disk reads
+
+def _session_path(uid: str) -> Path:
+    safe = re.sub(r'[^a-zA-Z0-9_\-]', '_', uid)
+    return SESSIONS_DIR / f"{safe}.pkl"
+
+def _load_session(uid: str) -> dict:
+    """Load session from disk, or create a fresh one."""
+    import pickle
+    p = _session_path(uid)
+    if p.exists():
+        try:
+            return pickle.loads(p.read_bytes())
+        except Exception:
+            pass  # corrupted pickle — start fresh
+    return {
+        "master_titles": [], "source_titles": [], "source_df": None,
+        "match_results": [], "clean_df": None, "clean_raw_df": None,
+        "clean_audit": [], "clean_config": {}, "api_key": "",
+        "std_clusters": [], "std_titles": [],
+    }
+
+def _save_session(uid: str, data: dict):
+    """Persist session to disk."""
+    import pickle
+    try:
+        _session_path(uid).write_bytes(pickle.dumps(data))
+    except Exception as e:
+        logger.warning(f"Could not save session for {uid}: {e}")
 
 def get_sdata(request: Request) -> dict:
     uid = request.session.get("user", {}).get("username", "_anon")
-    if uid not in _session_data:
-        _session_data[uid] = {
-            "master_titles": [], "source_titles": [], "source_df": None,
-            "match_results": [], "clean_df": None, "clean_raw_df": None,
-            "clean_audit": [], "clean_config": {}, "api_key": "",
-            "std_clusters": [], "std_titles": [],
-        }
-    return _session_data[uid]
+    if uid not in _session_cache:
+        _session_cache[uid] = _load_session(uid)
+    return _session_cache[uid]
+
+def save_sdata(request: Request):
+    """Call this after mutating session data to persist changes to disk."""
+    uid = request.session.get("user", {}).get("username", "_anon")
+    if uid in _session_cache:
+        _save_session(uid, _session_cache[uid])
 
 def _ai_active(sd: dict) -> bool:
     """Check if AI expansion is available (user key or env key)."""
@@ -1853,6 +1929,7 @@ async def upload_master(request: Request, file: UploadFile = File(...)):
         col = df.columns[0]
         titles = df[col].dropna().astype(str).unique().tolist()
         sd["master_titles"] = titles
+        save_sdata(request)
         return render("_upload_ok.html", request, message=f"Loaded {len(titles)} master titles from column '{col}'.")
     except Exception as e:
         return render("_upload_err.html", request, message=str(e))
@@ -1872,6 +1949,7 @@ async def upload_source(request: Request, file: UploadFile = File(...)):
         col = df.columns[0]
         sd["source_titles"] = df[col].dropna().astype(str).tolist()
         sd["source_df"] = df
+        save_sdata(request)
         return render("_upload_ok.html", request, message=f"Loaded {len(sd['source_titles'])} source titles from column '{col}'.")
     except Exception as e:
         return render("_upload_err.html", request, message=str(e))
@@ -1890,6 +1968,7 @@ async def run_matching(request: Request,
     results = run_full_matching(sd["source_titles"], sd["master_titles"],
                                 thresholds=thresholds)
     sd["match_results"] = results
+    save_sdata(request)
 
     # Save history
     n_auto = sum(1 for r in results if r.zone == "auto_approve")
@@ -1933,6 +2012,7 @@ async def edit_match(request: Request, idx: int):
         sd["match_results"][idx].status = "overridden"
         sd["match_results"][idx].explanation = f"Manually remapped to: {select_title}"
 
+    save_sdata(request)
     return RedirectResponse("/matching", status_code=303)
 
 @app.get("/matching/export/master/{fmt}")
@@ -1959,6 +2039,7 @@ async def approve_match(request: Request, idx: int):
     if idx < len(sd["match_results"]):
         sd["match_results"][idx].status = "approved"
         sd["match_results"][idx].zone = "auto_approve"
+    save_sdata(request)
     return RedirectResponse("/matching", status_code=303)
 
 @app.post("/matching/reject/{idx}")
@@ -1967,6 +2048,7 @@ async def reject_match(request: Request, idx: int):
     if idx < len(sd["match_results"]):
         sd["match_results"][idx].status = "rejected"
         sd["match_results"][idx].zone = "auto_reject"
+    save_sdata(request)
     return RedirectResponse("/matching", status_code=303)
 
 @app.get("/matching/export/{fmt}")
@@ -2034,6 +2116,7 @@ async def upload_cleaning(request: Request, file: UploadFile = File(...)):
         sd["clean_raw_df"] = df
         sd["clean_df"] = None
         sd["clean_audit"] = []
+        save_sdata(request)
         return render("_upload_ok.html", request, message=f"Loaded {len(df)} rows × {len(df.columns)} columns.")
     except Exception as e:
         return render("_upload_err.html", request, message=str(e))
@@ -2059,18 +2142,31 @@ async def run_cleaning_route(request: Request):
         "min_hourly": 5.0, "max_hourly": 500.0,
         "min_weekly": 50.0, "max_weekly": 20000.0,
         "sig_level": 0.05,
+        "missing_strategy": form.get("missing_strategy", "keep"),
     }
     sd["clean_config"] = config
 
     cleaned, audit = run_cleaning_pipeline(sd["clean_raw_df"], config)
     sd["clean_df"] = cleaned
     sd["clean_audit"] = audit
+    save_sdata(request)
 
     save_history("cleaning", len(sd["clean_raw_df"]), len(cleaned),
                  config, f"{sum(1 for a in audit if a['severity']=='warning')} issues found",
                  user.get("username", ""))
 
-    return RedirectResponse("/cleaning", status_code=303)
+    raw = sd["clean_raw_df"]
+    return render("cleaning.html", request,
+                  page="cleaning",
+                  data_rows=len(raw),
+                  data_cols=len(raw.columns),
+                  columns=list(raw.columns),
+                  detected_pay=detect_pay_columns(raw),
+                  audit_log=audit,
+                  original_rows=len(raw),
+                  cleaned_rows=len(cleaned),
+                  issues_count=sum(1 for e in audit if e.get("severity") in ("warning", "error")),
+                  flag_cols=len([c for c in cleaned.columns if str(c).startswith("FLAG_")]))
 
 @app.get("/cleaning/export/{fmt}")
 async def export_cleaning(request: Request, fmt: str):
@@ -2127,6 +2223,7 @@ async def run_standardize(request: Request, file: UploadFile = File(...),
         sd = get_sdata(request)
         sd["std_clusters"] = clusters
         sd["std_titles"] = titles
+        save_sdata(request)
 
         save_history("standardize", len(titles), len(clusters),
                      {"threshold": threshold},
@@ -2230,6 +2327,7 @@ async def save_api_key(request: Request, api_key: str = Form("")):
         return HTMLResponse("Unauthorized", status_code=401)
     sd = get_sdata(request)
     sd["api_key"] = api_key.strip()
+    save_sdata(request)
     return render("api_settings.html", request, page="api-settings",
                   current_key=sd.get("api_key", ""),
                   env_key=bool(os.environ.get("ANTHROPIC_API_KEY")),
@@ -2242,4 +2340,5 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
 
