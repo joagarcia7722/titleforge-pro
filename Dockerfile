@@ -7,6 +7,6 @@ COPY app.py .
  
 RUN mkdir -p /app/data
  
-ENV PORT=8000
-EXPOSE 8000
+ENV PORT=8080
+EXPOSE 8080
 CMD uvicorn app:app --host 0.0.0.0 --port $PORT
