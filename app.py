@@ -999,53 +999,83 @@ def run_cleaning_pipeline(df: pd.DataFrame, config: dict) -> tuple[pd.DataFrame,
 # SECTION 7: STANDARDIZE MODE — AUTO-CLUSTERING
 # ═══════════════════════════════════════════════════════════════
 
-def auto_cluster_titles(titles: list[str], threshold: float = 0.75,
-                        min_cluster_size: int = 2) -> list[dict]:
-    """Cluster similar titles using TF-IDF cosine similarity. No master list needed."""
-    clean = [normalize_text(expand_abbreviations(t)) for t in titles]
-    if not clean:
-        return []
+async def ai_standardize_titles(titles: list[str], api_key: str = "") -> list[dict]:
+    """
+    AI-powered individual title standardization.
+    Each dirty title is normalized to a clean, professional job title.
+    Falls back to rule-based expansion if no API key available.
+    Returns list of {original, standardized, method} dicts.
+    """
+    key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+    results = []
 
-    vec = TfidfVectorizer(analyzer='char_wb', ngram_range=(2, 4), min_df=1)
-    tfidf = vec.fit_transform(clean)
-    sim_matrix = cosine_similarity(tfidf)
+    if not key:
+        # Fallback: rule-based abbreviation expansion
+        for t in titles:
+            standardized = expand_abbreviations(t)
+            # Title-case it nicely
+            standardized = " ".join(w.capitalize() for w in standardized.split())
+            results.append({"original": t, "standardized": standardized, "method": "rules"})
+        return results
 
-    assigned = set()
-    clusters = []
+    # AI path: batch in groups of 50
+    all_mappings = {}
+    try:
+        for batch_start in range(0, len(titles), 50):
+            batch = titles[batch_start:batch_start + 50]
+            titles_text = "\n".join(f"- {t}" for t in batch)
 
-    # Greedy clustering
-    for i in range(len(titles)):
-        if i in assigned:
-            continue
-        cluster_indices = [i]
-        assigned.add(i)
-        for j in range(i + 1, len(titles)):
-            if j in assigned:
-                continue
-            if sim_matrix[i][j] >= threshold:
-                cluster_indices.append(j)
-                assigned.add(j)
+            async with httpx.AsyncClient(timeout=45) as client:
+                resp = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": key,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json={
+                        "model": "claude-3-5-sonnet-20241022",
+                        "max_tokens": 2000,
+                        "messages": [{"role": "user", "content": f"""You are a job title standardization expert.
 
-        if len(cluster_indices) >= min_cluster_size:
-            # Pick canonical: longest cleaned title as representative
-            members = [(titles[idx], clean[idx]) for idx in cluster_indices]
-            canonical = max(members, key=lambda x: len(x[1]))[0]
-            clusters.append({
-                "canonical": canonical,
-                "members": [titles[idx] for idx in cluster_indices],
-                "size": len(cluster_indices),
-                "avg_similarity": float(np.mean([sim_matrix[cluster_indices[0]][j]
-                                                  for j in cluster_indices])),
-            })
-        elif len(cluster_indices) == 1:
-            clusters.append({
-                "canonical": titles[i],
-                "members": [titles[i]],
-                "size": 1,
-                "avg_similarity": 1.0,
-            })
+Standardize each of the following job titles into a clean, professional, properly capitalized form.
+Rules:
+- Fix typos and abbreviations (e.g. "jave Dev" → "Java Developer", "RN ICU" → "ICU Registered Nurse")
+- Expand abbreviations (Sr → Senior, Mgr → Manager, Dev → Developer, etc.)
+- Use proper title case
+- Keep it concise and professional
+- Do NOT add or infer extra words not implied by the original
+- Return ONLY a JSON object mapping each original title exactly to its standardized form
+- No markdown, no explanation, just the raw JSON
 
-    return clusters
+Titles:
+{titles_text}"""}],
+                    }
+                )
+                data = resp.json()
+                text = data.get("content", [{{}}])[0].get("text", "{{}}")
+                text = re.sub(r'```json|```', '', text).strip()
+                mappings = json.loads(text)
+                all_mappings.update(mappings)
+
+    except Exception as e:
+        logger.warning(f"AI standardization failed: {{e}}. Falling back to rules.")
+        for t in titles:
+            if t not in all_mappings:
+                fb = expand_abbreviations(t)
+                all_mappings[t] = " ".join(w.capitalize() for w in fb.split())
+
+    for t in titles:
+        standardized = all_mappings.get(t)
+        if not standardized:
+            fb = expand_abbreviations(t)
+            standardized = " ".join(w.capitalize() for w in fb.split())
+            method = "rules"
+        else:
+            method = "ai"
+        results.append({"original": t, "standardized": standardized, "method": method})
+
+    return results
 
 # ═══════════════════════════════════════════════════════════════
 # SECTION 8: HISTORY TRACKER
@@ -1588,69 +1618,126 @@ TEMPLATES["standardize.html"] = """{% extends "base.html" %}
 {% block title %}Standardize — TitleForge Pro{% endblock %}
 {% block content %}
 <div class="mb-6">
-  <h1 class="font-display text-2xl font-bold text-slate-900 tracking-tight">Standardize Mode</h1>
-  <p class="text-sm text-slate-500 mt-0.5">Auto-cluster dirty titles without a master list</p>
+  <h1 class="font-display text-2xl font-bold text-slate-900 tracking-tight">Standardize Titles</h1>
+  <p class="text-sm text-slate-500 mt-0.5">AI-powered individual title normalization — typos, abbreviations, and formatting fixed automatically</p>
 </div>
 
-<div class="card p-5 mb-6">
-  <form hx-post="/standardize/run" hx-encoding="multipart/form-data" hx-target="#std-results" hx-swap="innerHTML" hx-indicator="#std-spinner">
-    <div class="grid grid-cols-2 gap-4 mb-4">
-      <div>
-        <label class="block text-xs text-slate-500 font-medium mb-1">Upload Titles (CSV/Excel)</label>
-        <input type="file" name="file" accept=".csv,.xlsx" class="block w-full text-xs text-slate-500 file:mr-3 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-violet-50 file:text-violet-700 cursor-pointer">
-      </div>
-      <div>
-        <label class="block text-xs text-slate-500 font-medium mb-1">Similarity Threshold</label>
-        <input name="threshold" type="number" value="0.75" step="0.05" min="0.3" max="0.99" class="w-full border rounded-lg px-3 py-2 text-sm">
-        <p class="text-[11px] text-slate-400 mt-1">Higher = stricter grouping. 0.75 is a good default.</p>
-      </div>
+{% if not ai_active %}
+<div class="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 mb-5 flex items-center gap-3">
+  <i data-lucide="alert-triangle" class="w-4 h-4 text-amber-500 flex-shrink-0"></i>
+  <span class="text-sm text-amber-700">No Anthropic API key set — using rule-based fallback. <a href="/api-settings" class="underline font-medium">Add a key</a> for full AI accuracy.</span>
+</div>
+{% endif %}
+
+<!-- Upload -->
+<div class="card p-5 mb-5">
+  <div class="flex items-center gap-2 mb-3">
+    <i data-lucide="upload" class="w-4 h-4 text-violet-600"></i>
+    <span class="font-display font-semibold text-sm">Upload Titles</span>
+  </div>
+  <form hx-post="/standardize/upload" hx-encoding="multipart/form-data" hx-target="#std-upload-status" hx-swap="innerHTML">
+    <div class="flex items-center gap-3">
+      <input type="file" name="file" accept=".csv,.xlsx" class="block text-xs text-slate-500 file:mr-3 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-violet-50 file:text-violet-700 hover:file:bg-violet-100 cursor-pointer">
+      <button type="submit" class="btn-primary text-xs px-4 py-2 flex items-center gap-1.5"><i data-lucide="upload" class="w-3 h-3"></i> Upload</button>
     </div>
-    <button type="submit" class="btn-primary text-sm flex items-center gap-2"><i data-lucide="layers" class="w-4 h-4"></i> Run Clustering</button>
-    <span id="std-spinner" class="htmx-indicator text-sm text-violet-600 ml-3">Clustering...</span>
+    <p class="text-[11px] text-slate-400 mt-2">CSV or Excel — first column should contain the job titles to standardize.</p>
+  </form>
+  <div id="std-upload-status" class="mt-2"></div>
+</div>
+
+<!-- Run -->
+<div class="card p-5 mb-5">
+  <form hx-post="/standardize/run" hx-target="#std-results" hx-swap="innerHTML" hx-indicator="#std-spinner">
+    <div class="flex items-center gap-4">
+      <button type="submit" class="btn-primary text-sm flex items-center gap-2">
+        <i data-lucide="sparkles" class="w-4 h-4"></i>
+        {% if ai_active %}Run AI Standardization{% else %}Run Rule-Based Standardization{% endif %}
+      </button>
+      <span id="std-spinner" class="htmx-indicator text-sm text-violet-600 flex items-center gap-1.5">
+        <svg class="animate-spin w-4 h-4" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"></path></svg>
+        Standardizing titles{% if ai_active %} with AI{% endif %}...
+      </span>
+    </div>
   </form>
 </div>
 
+<!-- Results -->
 <div id="std-results">
-{% if clusters %}
-  <div class="grid grid-cols-3 gap-4 mb-6">
-    <div class="card stat-card"><div class="stat-val text-violet-600">{{ clusters|length }}</div><div class="stat-label">Clusters</div></div>
-    <div class="card stat-card"><div class="stat-val text-blue-600">{{ total_titles }}</div><div class="stat-label">Total Titles</div></div>
-    <div class="card stat-card"><div class="stat-val text-emerald-600">{{ multi_clusters }}</div><div class="stat-label">Multi-Title Groups</div></div>
-  </div>
-
-  <div class="card p-4 mb-6">
-    <div class="flex items-center justify-between">
-      <span class="font-display font-semibold text-sm">Export Standardized Data</span>
-      <div class="flex gap-2">
-        <a href="/standardize/export/csv" class="btn-secondary text-xs px-3 py-1.5 flex items-center gap-1"><i data-lucide="download" class="w-3 h-3"></i> Export CSV</a>
-        <a href="/standardize/export/xlsx" class="btn-secondary text-xs px-3 py-1.5 flex items-center gap-1"><i data-lucide="download" class="w-3 h-3"></i> Export Excel</a>
-      </div>
+{% if results %}
+  <!-- Stats bar -->
+  <div class="grid grid-cols-3 gap-4 mb-5">
+    <div class="card stat-card">
+      <div class="stat-val text-violet-600">{{ results|length }}</div>
+      <div class="stat-label">Titles Processed</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-val text-blue-600">{{ results|selectattr("method","eq","ai")|list|length }}</div>
+      <div class="stat-label">AI Standardized</div>
+    </div>
+    <div class="card stat-card">
+      <div class="stat-val text-emerald-600">{{ results|selectattr("method","eq","manual")|list|length }}</div>
+      <div class="stat-label">Manually Edited</div>
     </div>
   </div>
 
-  <div class="space-y-3">
-  {% for c in clusters %}
-    <div class="card p-4">
-      <div class="flex items-center justify-between mb-2">
-        <div class="flex items-center gap-2">
-          <span class="font-display font-semibold text-sm text-slate-900">{{ c.canonical }}</span>
-          <span class="badge badge-blue">{{ c.size }} titles</span>
-          <span class="badge badge-slate">{{ "%.0f"|format(c.avg_similarity * 100) }}% avg sim</span>
-        </div>
-      </div>
-      {% if c.size > 1 %}
-      <div class="flex flex-wrap gap-1.5 mt-2">
-        {% for m in c.members %}
-        <span class="text-xs px-2 py-1 rounded-md {% if m == c.canonical %}bg-blue-100 text-blue-700 font-medium{% else %}bg-slate-100 text-slate-600{% endif %}">{{ m }}</span>
+  <!-- Export -->
+  <div class="card p-4 mb-4 flex items-center justify-between">
+    <span class="font-display font-semibold text-sm text-slate-800">Export Results</span>
+    <div class="flex gap-2">
+      <a href="/standardize/export/csv" class="btn-secondary text-xs px-3 py-1.5 flex items-center gap-1"><i data-lucide="download" class="w-3 h-3"></i> CSV</a>
+      <a href="/standardize/export/xlsx" class="btn-secondary text-xs px-3 py-1.5 flex items-center gap-1"><i data-lucide="download" class="w-3 h-3"></i> Excel</a>
+    </div>
+  </div>
+
+  <!-- Results table -->
+  <div class="card overflow-hidden">
+    <table class="w-full text-sm">
+      <thead class="bg-slate-50 border-b border-slate-100">
+        <tr>
+          <th class="text-left px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wide w-8">#</th>
+          <th class="text-left px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wide">Original Title</th>
+          <th class="text-left px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wide">Standardized Title</th>
+          <th class="text-left px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wide w-24">Method</th>
+          <th class="px-4 py-3 w-16"></th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-slate-50">
+        {% for r in results %}
+        <tr class="hover:bg-slate-50/50 transition-colors group" id="row-{{ loop.index0 }}">
+          <td class="px-4 py-3 text-xs text-slate-400">{{ loop.index }}</td>
+          <td class="px-4 py-3 text-slate-500 font-mono text-xs">{{ r.original }}</td>
+          <td class="px-4 py-3 font-semibold text-slate-900">{{ r.standardized }}</td>
+          <td class="px-4 py-3">
+            <span class="badge {% if r.method == 'ai' %}badge-blue{% elif r.method == 'manual' %}badge-green{% else %}badge-slate{% endif %} text-[10px]">
+              {{ r.method }}
+            </span>
+          </td>
+          <td class="px-4 py-3">
+            <button onclick="document.getElementById('edit-{{ loop.index0 }}').classList.toggle('hidden')"
+                    class="opacity-0 group-hover:opacity-100 transition p-1.5 rounded hover:bg-slate-100 text-slate-400">
+              <i data-lucide="pencil" class="w-3.5 h-3.5"></i>
+            </button>
+          </td>
+        </tr>
+        <tr id="edit-{{ loop.index0 }}" class="hidden bg-violet-50/40">
+          <td colspan="5" class="px-4 py-3">
+            <form method="POST" action="/standardize/edit/{{ loop.index0 }}" class="flex items-center gap-3">
+              <input type="text" name="new_title" value="{{ r.standardized }}"
+                     class="flex-1 border border-slate-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-violet-500/30">
+              <button type="submit" class="btn-primary text-xs px-3 py-1.5">Save</button>
+              <button type="button" onclick="document.getElementById('edit-{{ loop.index0 }}').classList.add('hidden')"
+                      class="btn-secondary text-xs px-3 py-1.5">Cancel</button>
+            </form>
+          </td>
+        </tr>
         {% endfor %}
-      </div>
-      {% endif %}
-    </div>
-  {% endfor %}
+      </tbody>
+    </table>
   </div>
 {% endif %}
 </div>
-{% endblock %}"""
+{% endblock %}
+{% block scripts %}<script>document.body.addEventListener('htmx:afterSwap', function(){ lucide.createIcons(); });</script>{% endblock %}"""
 
 TEMPLATES["history.html"] = """{% extends "base.html" %}
 {% block title %}History — TitleForge Pro{% endblock %}
@@ -2202,60 +2289,86 @@ async def standardize_page(request: Request):
     user = request.session.get("user")
     if not user:
         return RedirectResponse("/login", status_code=303)
-    return render("standardize.html", request, page="standardize", clusters=None)
+    sd = get_sdata(request)
+    return render("standardize.html", request, page="standardize",
+                  results=sd.get("std_results", []),
+                  ai_active=_ai_active(sd))
 
-@app.post("/standardize/run")
-async def run_standardize(request: Request, file: UploadFile = File(...),
-                          threshold: float = Form(0.75)):
+@app.post("/standardize/upload")
+async def standardize_upload(request: Request, file: UploadFile = File(...)):
     user = request.session.get("user")
     if not user:
         return HTMLResponse("Unauthorized", status_code=401)
+    sd = get_sdata(request)
     try:
         content = await file.read()
-        if file.filename.endswith('.csv'):
+        if file.filename.endswith(".csv"):
             df = pd.read_csv(io.BytesIO(content))
         else:
             df = pd.read_excel(io.BytesIO(content))
-        titles = df.iloc[:, 0].dropna().astype(str).tolist()
-        clusters = auto_cluster_titles(titles, threshold=threshold, min_cluster_size=1)
-
-        # Store for export
-        sd = get_sdata(request)
-        sd["std_clusters"] = clusters
-        sd["std_titles"] = titles
+        col = df.columns[0]
+        titles = df[col].dropna().astype(str).unique().tolist()
+        sd["std_raw_titles"] = titles
+        sd["std_results"] = []
         save_sdata(request)
-
-        save_history("standardize", len(titles), len(clusters),
-                     {"threshold": threshold},
-                     f"{len(clusters)} clusters from {len(titles)} titles",
-                     user.get("username", ""))
-
-        multi = sum(1 for c in clusters if c["size"] > 1)
-        return render("standardize.html", request, page="standardize",
-                      clusters=clusters, total_titles=len(titles), multi_clusters=multi)
+        return render("_upload_ok.html", request,
+                      message=f"Loaded {len(titles)} unique titles from column '{col}'.")
     except Exception as e:
         return render("_upload_err.html", request, message=str(e))
 
+@app.post("/standardize/run")
+async def run_standardize(request: Request):
+    user = request.session.get("user")
+    if not user:
+        return HTMLResponse("Unauthorized", status_code=401)
+    sd = get_sdata(request)
+    titles = sd.get("std_raw_titles", [])
+    if not titles:
+        return render("_upload_err.html", request, message="Upload a file first.")
+
+    results = await ai_standardize_titles(titles, api_key=sd.get("api_key", ""))
+    sd["std_results"] = results
+    save_sdata(request)
+
+    ai_count = sum(1 for r in results if r["method"] == "ai")
+    save_history("standardize", len(titles), len(results),
+                 {"method": "ai" if ai_count else "rules"},
+                 f"{ai_count} AI-standardized, {len(results) - ai_count} rule-based",
+                 user.get("username", ""))
+
+    return render("standardize.html", request, page="standardize",
+                  results=results, ai_active=_ai_active(sd))
+
+@app.post("/standardize/edit/{idx}")
+async def edit_standardize(request: Request, idx: int):
+    """Allow user to manually correct a standardized title."""
+    user = request.session.get("user")
+    if not user:
+        return HTMLResponse("Unauthorized", status_code=401)
+    sd = get_sdata(request)
+    form = await request.form()
+    new_title = form.get("new_title", "").strip()
+    results = sd.get("std_results", [])
+    if idx < len(results) and new_title:
+        results[idx]["standardized"] = new_title
+        results[idx]["method"] = "manual"
+        save_sdata(request)
+    return render("standardize.html", request, page="standardize",
+                  results=results, ai_active=_ai_active(sd))
+
 @app.get("/standardize/export/{fmt}")
 async def export_standardize(request: Request, fmt: str):
-    """Export standardized clusters as CSV or Excel."""
     sd = get_sdata(request)
-    clusters = sd.get("std_clusters", [])
-    if not clusters:
-        return HTMLResponse("No clusters to export")
-    rows = []
-    for c in clusters:
-        for m in c["members"]:
-            rows.append({
-                "Original Title": m,
-                "Standardized Title": c["canonical"],
-                "Cluster Size": c["size"],
-                "Avg Similarity": round(c["avg_similarity"], 3),
-            })
+    results = sd.get("std_results", [])
+    if not results:
+        return HTMLResponse("No results to export")
+    rows = [{"Original Title": r["original"],
+             "Standardized Title": r["standardized"],
+             "Method": r["method"]} for r in results]
     df = pd.DataFrame(rows)
     if fmt == "xlsx":
         buf = io.BytesIO()
-        df.to_excel(buf, index=False, engine='openpyxl')
+        df.to_excel(buf, index=False, engine="openpyxl")
         return StreamingResponse(io.BytesIO(buf.getvalue()),
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers={"Content-Disposition": f"attachment; filename=standardized_{datetime.now():%Y%m%d}.xlsx"})
